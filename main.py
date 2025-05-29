@@ -1,4 +1,3 @@
-# main.py
 import os
 import pysrt  # ライブラリが未インストールの場合は "pip install pysrt" が必要
 import openai
@@ -13,6 +12,17 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 def parse_structured_output(text_block):
     import re
     fields = ["headline", "overview", "category", "tags", "stance", "timestamp"]
+    # --- fast‑path: if the block looks like a CSV record (no 【】) -------------
+    if "【" not in text_block and "," in text_block:
+        import csv, io
+        # take the first non-empty line
+        first = next((ln for ln in text_block.splitlines() if ln.strip()), "")
+        if first:
+            row = next(csv.reader([first]))
+            # pad or trim to exactly 6 columns
+            if len(row) < 6:
+                row += ["NULL"] * (6 - len(row))
+            return row[:6]
     result = {field: "NULL" for field in fields}
     for line in text_block.splitlines():
         match = re.match(r"^【(.*?)】(.*)", line.strip())
@@ -144,48 +154,65 @@ def parse_srt_as_subs(file_path: str):
     return result
 
 ############################################
-# 字幕を 2000文字単位でチャンク化しつつ、
+# 字幕を 60分単位でチャンク化しつつ、
 # 先頭のインデックスを "timestamp" として保持
 ############################################
-def chunk_srt_subs_with_timestamp(subs_list, chunk_size=2000):
+def chunk_srt_subs_with_timestamp(subs_list, max_minutes=60):
     """
-    subs_list: [(index, text), (index, text), ...]
-    連結しながら 2000文字ごとにチャンクに分割。
+    Break subtitles into chunks whose total duration does not exceed *max_minutes*.
+    Each chunk keeps the timestamp of its first subtitle as `timestamp`.
 
-    戻り値はリスト: [ { 'text': str, 'timestamp': str }, ... ]
-    * 'timestamp' には チャンク内で最初に登場した字幕の timestamp を入れる
+    Parameters
+    ----------
+    subs_list : list[tuple]
+        List of tuples (index, start_time_str, sub_text) where *start_time_str*
+        is `"HH:MM:SS,mmm"`.
+    max_minutes : int, optional
+        Maximum duration of one chunk, in minutes.  Default is 60 (≈1 hour).
+
+    Returns
+    -------
+    list[dict]
+        `[{'text': str, 'timestamp': str}, ...]`
+        *text*  – concatenated subtitle blocks in this chunk  
+        *timestamp* – start time of the first subtitle in the chunk
     """
+    max_duration_sec = max_minutes * 60
+
     chunks = []
     current_text = []
-    current_length = 0
     first_timestamp_in_chunk = None
+    first_time_sec = None
 
-    for (sub_index, start_time_str, sub_text) in subs_list:
-        block_str = f"{start_time_str} {sub_text}\n"
-        block_len = len(block_str)
+    for (_, start_time_str, sub_text) in subs_list:
+        # Parse start_time_str "HH:MM:SS,mmm" → seconds (float)
+        h, m, rest = start_time_str.split(':')
+        s, ms = rest.split(',')
+        current_sec = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
-        # 新しいチャンクを開始するときに first_timestamp_in_chunk をセット
-        if first_timestamp_in_chunk is None:
+        # Initialise the first timestamp of a new chunk
+        if first_time_sec is None:
+            first_time_sec = current_sec
             first_timestamp_in_chunk = start_time_str
 
-        if current_length + block_len > chunk_size and current_length > 0:
-            # 今のチャンクを確定
+        # If adding this subtitle would exceed the chunk duration limit,
+        # close the current chunk and start a new one.
+        if current_sec - first_time_sec >= max_duration_sec and current_text:
             chunks.append({
-                'text': "".join(current_text),
+                'text': ''.join(current_text),
                 'timestamp': first_timestamp_in_chunk
             })
-            # 新チャンクを開始
             current_text = []
-            current_length = 0
+            first_time_sec = current_sec
             first_timestamp_in_chunk = start_time_str
 
-        current_text.append(block_str)
-        current_length += block_len
+        # Append current subtitle block
+        current_text.append(f"{start_time_str} {sub_text}\n")
 
-    # 最後の塊
+    # Flush the final chunk
     if current_text:
         chunks.append({
-            'text': "".join(current_text),
+            'text': ''.join(current_text),
             'timestamp': first_timestamp_in_chunk
         })
 
@@ -201,36 +228,87 @@ def summarize_chunk(text_chunk, system_prompt, timestamp):
     - timestamp: チャンク内で最初に登場した字幕のインデックス
     """
     prompt_input = f"""
-    あなたは議事録の要約に特化したAIです。次の要件を厳守してください。
-    
-    【目的】
-    自治体関係者・民間事業者が「自分たちに関係ある話題かどうか」をヘッドラインと要約だけで判断できるようにすること。
-    
-    【出力形式】
-    以下の6項目を順番通り、【項目名】とその内容をセットで1行ずつ出力してください（CSV形式にはしないでください）。
-    
-    【headline】60文字以内で、議論の概要がすぐ分かる短いタイトル
-    【overview】700文字以上で、以下を網羅：
-     - 背景（どんな問題意識があるのか）
-     - 誰が何を提案・指摘・質問し、誰がどう答えたか
-     - 今後の方向性（導入するのか、検討中なのか、否定されたのか）
-     - 議論の中心や結論が述べられた時間帯（例: (00:23:45)）を文中に必ず含めること
-    【category】以下から該当するものを1つ以上（/区切りで複数可）：
-    地域振興・活性化 / 社会保障・福祉 / 防災・安全 / 教育 / 環境・エネルギー / 医療・健康 / 都市計画・インフラ / 行政運営・ガバナンス / 文化・スポーツ / その他
-    【tags】活発だった議論を示す最大3つのキーワード（ない場合は NULL）
-    【stance】以下のいずれかを1つ記入（日本語）：
-     導入決定
-     導入済み
-     内部決定・制度化
-     前向き
-     検討中
-     調査・情報収集段階
-     慎重・消極的
-     反対・否定
-     情報不足・判断不能
-     実証・試行段階
-     要望・提案段階
-    【timestamp】議論の結論や方向性が示された時間帯（例: 00:20:00〜00:25:00）
+    あなたは議事録の要約に特化したAIアシスタントです。以下の指示を厳守し、与えられた字幕テキスト（議事録）を分類・要約してください。
+
+━━━━━━━━━━━━━━
+【目的】
+自治体関係者および民間事業者が、ヘッドラインと要約だけで「自分たちに関係のある議題かどうか」を瞬時に判別できるようにする。
+
+━━━━━━━━━━━━━━
+【出力フォーマット（CSV形式）】
+ヘッダーを含む 6 列で 1 行出力してください。カンマ区切り、改行コードは "\n"。
+
+headline,overview,category,tags,stance,timestamp
+
+## 各列の要件
+
+◆ headline（60文字以内）
+
+* テーマの概要が一目でわかる短いタイトル。
+
+◆ overview（700文字以上）
+
+* 背景（問題意識・経緯）
+* 「誰が何を提案・指摘・質問し、誰がどう答えたか」
+* 今後の方向性（導入済みか・検討中か・否定されたか等）
+* 議論の要点や結論が語られた時間を本文中に必ず "(HH\:MM\:SS)" 形式で挿入
+* 冗長な挨拶・定型句は除く
+
+◆ category（1 つ）
+次の 20 分類から最も適切な 1 つを記入。
+子育て・保育 / 学校教育・生涯学習 / 福祉・包摂（高齢・障がい・困窮） / 医療・公衆衛生 / 防災・危機管理・安全安心 / 環境・エネルギー / 経済・雇用・産業振興 / 農林水産業 / 都市整備・土地利用（ハード） / インフラ・公共施設 / 交通・モビリティ / デジタル・ICT推進 / 行政手続・窓口サービス / 財政・税務 / 総務・人事・組織運営 / 政策立案・企画・計画 / 議会・選挙・ガバナンス / 地域活性・コミュニティ（ソフト） / 市民協働・広報 / 人権・男女共同参画（ダイバーシティ）
+
+◆ tags（最大 3 つ）
+
+* 議論が活発だった主要キーワードをカンマ区切りで最大 3 つ。
+* 該当しない場合は NULL。
+
+◆ stance（1 つ）
+
+* 次の 6 つのいずれかを記入（日本語）。
+
+  1. 導入済み・決定済み
+  2. 前向き・推進意向
+  3. 検討中・調査中
+  4. 慎重・消極的
+  5. 否定・反対
+  6. 判断困難・情報不足
+
+◆ timestamp
+
+* 議論の結論や方向性が示された時間帯を "HH\:MM\:SS〜HH\:MM\:SS" 形式で記入。
+
+━━━━━━━━━━━━━━
+【スタンス判定に関する注意事項】
+
+* 数値（利用者数・予算額など）が登場しても、それ自体は導入状況を示す根拠にはなりません。発言者の意図・態度に着目してください。
+* 具体的に「導入済み」「制度化が決定」「今後導入する方針」などが示されているかどうかを優先判断します。
+
+━━━━━━━━━━━━━━
+【入力テンプレート】
+▼ 以下の <<TEXT>> を置き換えて実行
+
+＜入力例＞
+
+```
+【TEXT】
+<<ここに字幕テキスト（原文チャンク）をそのまま貼り付ける>>
+```
+
+━━━━━━━━━━━━━━
+【出力例】
+headline,overview,category,tags,stance,timestamp
+"子ども食堂への支援拡大案","(00:12:30) 地域の子ども食堂への財政支援の必要性について議論。山田議員が孤食問題と経済格差の影響を挙げて支援拡大を提案。市側は現状の支援策を説明しつつ、他自治体の事例も参考に柔軟に対応していきたいと回答。(00:14:50) 市長は『予算調整が必要だが、前向きに検討したい』と発言。複数議員から利用者数の把握と事後評価の必要性が指摘され、今後、令和7年度予算編成の中で具体化を目指す。","福祉・包摂（高齢・障がい・困窮）","子ども食堂,孤食,貧困対策","前向き・推進意向","00:12:30〜00:15:00"
+
+━━━━━━━━━━━━━━
+【禁止事項】
+
+* 空行やヘッダー以外の複数行出力
+* 推測や脚色、主観的評価
+* 挨拶・形式的な文言（例:「よろしくお願いします」「賛成多数で可決」）
+
+以上。
+
     
     以下が対象テキストです：
     Timestamp: {timestamp}
@@ -239,7 +317,7 @@ def summarize_chunk(text_chunk, system_prompt, timestamp):
     """.strip()
 
     response = openai.chat.completions.create(
-        model="gpt-4o-mini-2024-07-18",
+        model="gpt-4.1-nano-2025-04-14",
         messages=[{"role": "user", "content": prompt_input}],
         max_tokens=2000,
         temperature=0.0
@@ -331,11 +409,27 @@ if __name__ == "__main__":
   ・議論の中心や結論が述べられた時間帯（例: (00:23:45)）を文中に挿入
 
 - category:
-  以下の10分類から該当するものを1つまたは複数記入（「/」区切り）
-    地域振興・活性化 / 社会保障・福祉 / 防災・安全 / 教育 /
-    環境・エネルギー / 医療・健康 / 都市計画・インフラ /
-    行政運営・ガバナンス / 文化・スポーツ / その他
-
+  以下の20分類から該当するものを1つ記入
+子育て・保育
+学校教育・生涯学習
+福祉・包摂（高齢・障がい・困窮）
+医療・公衆衛生
+防災・危機管理・安全安心
+環境・エネルギー
+経済・雇用・産業振興
+農林水産業
+都市整備・土地利用（ハード）
+インフラ・公共施設
+交通・モビリティ
+デジタル・ICT推進
+行政手続・窓口サービス
+財政・税務
+総務・人事・組織運営
+政策立案・企画・計画
+議会・選挙・ガバナンス
+地域活性・コミュニティ（ソフト）
+市民協働・広報
+人権・男女共同参画（ダイバーシティ）
 - tags:
   議論が活発だったものだけ、最大3つまでの重要キーワード（例: 高齢化,こども食堂）。
   特に頻出していないテーマは「NULL」とする。
@@ -390,8 +484,8 @@ headline,overview,category,tags,stance,timestamp
         print(f"=== Processing: {filename} ===")
         subs_list = parse_srt_as_subs(file_path)
 
-        # 2000文字単位でチャンク化（先頭字幕のtimestampを保持）
-        chunks = chunk_srt_subs_with_timestamp(subs_list, 2000)
+        # 60分単位でチャンク化（先頭字幕のtimestampを保持）
+        chunks = chunk_srt_subs_with_timestamp(subs_list, 60)
 
         all_csv_outputs = []
 
