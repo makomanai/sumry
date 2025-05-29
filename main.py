@@ -1,3 +1,8 @@
+try:
+    import pysrt
+except ImportError:
+    import subprocess
+    subprocess.check_call(["pip", "install", "pysrt"])
 import os
 import pysrt  # ライブラリが未インストールの場合は "pip install pysrt" が必要
 import openai
